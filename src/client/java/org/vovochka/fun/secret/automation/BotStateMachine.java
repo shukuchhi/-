@@ -1,5 +1,6 @@
 package org.vovochka.fun.secret.automation;
 
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
 
 /**
@@ -15,6 +16,11 @@ public abstract class BotStateMachine {
 
     public abstract void onScreenOpened(HandledScreen<?> screen);
     public abstract void onCaptchaAnswer(String answer);
+
+    /**
+     * Вызывается на каждом игровом тике клиента для плавной ходьбы и контроля движения.
+     */
+    public void tickMovement(MinecraftClient client) {}
 
     // IPC колбэки
     public abstract void onBankConnected(String bankNick);

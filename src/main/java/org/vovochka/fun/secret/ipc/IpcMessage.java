@@ -22,7 +22,12 @@ public class IpcMessage {
         STAVKA_LOSS,         // Ставка проиграна
         PING,                // Проверка связи
         PONG,                // Ответ
-        ERROR                // Ошибка
+        ERROR,               // Ошибка
+
+        // Новые типы для динамического раунда ставок
+        WORKER_REPORT_BALANCES,  // Твинк отправляет Банку свои "cc|coins"
+        WORKER_CREATE_STAVKA,    // Банк просит Твинка создать ставку на сумму X
+        BANK_CREATED_STAVKA      // Банк сообщает Твинку, что создал ставку, можно принимать
     }
 
     public final Type type;

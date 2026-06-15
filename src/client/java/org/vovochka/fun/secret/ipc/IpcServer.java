@@ -2,11 +2,10 @@ package org.vovochka.fun.secret.ipc;
 
 import org.vovochka.fun.secret.Secret;
 import org.vovochka.fun.secret.SecretClient;
+import org.vovochka.fun.secret.automation.BankBotStateMachine;
 
 import java.io.*;
 import java.net.*;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * IPC Сервер - запускается на БАНКЕ (порт 19876)
@@ -72,7 +71,6 @@ public class IpcServer {
             ) {
                 this.writer = pw;
 
-                // Отправляем приветствие с ником банка
                 String bankNick = SecretClient.accountManager != null
                         ? SecretClient.accountManager.getBankNick()
                         : "BankUnknown";
@@ -80,7 +78,6 @@ public class IpcServer {
                 send(new IpcMessage(IpcMessage.Type.HELLO_BANK, bankNick));
                 Secret.LOGGER.info("[IPC-Server] Sent HELLO_BANK: {}", bankNick);
 
-                // Читаем сообщения от твинка
                 String line;
                 while ((line = reader.readLine()) != null) {
                     IpcMessage msg = IpcMessage.deserialize(line);
@@ -102,19 +99,15 @@ public class IpcServer {
         handlerThread.start();
     }
 
-    /**
-     * Обработка сообщений от твинка
-     */
     private void onMessageFromWorker(IpcMessage msg) {
         switch (msg.type) {
             case HELLO_WORKER -> {
                 Secret.LOGGER.info("[IPC-Server] Worker nick: {}", msg.data);
                 if (SecretClient.telegramBot != null) {
                     SecretClient.telegramBot.sendMessage(
-                            "🔗 Твинк подключился: " + msg.data
+                            "🔗 Твинк подклютился: " + msg.data
                     );
                 }
-                // Если банк уже на сервере - сразу отвечаем BANK_READY
                 if (SecretClient.stateMachine != null &&
                         SecretClient.stateMachine.getCurrentState() ==
                                 org.vovochka.fun.secret.automation.BotState.IDLE) {
@@ -122,8 +115,20 @@ public class IpcServer {
                 }
             }
 
+            case WORKER_REPORT_BALANCES -> {
+                if (SecretClient.stateMachine instanceof BankBotStateMachine bankMachine) {
+                    try {
+                        String[] parts = msg.data.split("\\|", 2);
+                        int wCC = Integer.parseInt(parts[0].trim());
+                        int wCoins = Integer.parseInt(parts[1].trim());
+                        bankMachine.syncFromWorker(wCC, wCoins);
+                    } catch (Exception e) {
+                        Secret.LOGGER.error("[IPC-Server] Error parsing worker balances: {}", msg.data);
+                    }
+                }
+            }
+
             case STAVKA_CREATED -> {
-                // Формат data: "НикТвинка|КоличествоКК"
                 String[] parts = msg.data.split("\\|", 2);
                 String workerNick = parts.length > 0 ? parts[0] : "";
                 int amount = 0;
@@ -134,10 +139,6 @@ public class IpcServer {
                         Secret.LOGGER.error("[IPC-Server] Invalid amount: {}", parts[1]);
                     }
                 }
-
-                Secret.LOGGER.info("[IPC-Server] Stavka created by {} for {} KK",
-                        workerNick, amount);
-
                 if (SecretClient.stateMachine != null) {
                     SecretClient.stateMachine.onWorkerCreatedStavka(workerNick, amount);
                 }
@@ -159,9 +160,6 @@ public class IpcServer {
         }
     }
 
-    /**
-     * Отправить сообщение твинку
-     */
     public void send(IpcMessage msg) {
         PrintWriter pw = this.writer;
         if (pw != null) {

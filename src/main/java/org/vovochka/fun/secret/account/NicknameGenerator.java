@@ -8,31 +8,42 @@ import java.util.*;
 
 public class NicknameGenerator {
 
-    // Файл хранится рядом с игрой в папке config
     private static final Path NICKS_FILE = Paths.get("config", "secret_nicks.txt");
 
+    // Огромный расширенный список префиксов (более 100+ комбинаций)
     private static final String[] PREFIXES = {
             "Alex", "Max", "Pro", "Dark", "Cool", "Neo", "Sky", "Red", "Blue", "Fast",
-            "Top", "Big", "Hot", "Ice", "Fire", "Wind", "Star", "Wolf", "Fox", "Bear"
+            "Top", "Big", "Hot", "Ice", "Fire", "Wind", "Star", "Wolf", "Fox", "Bear",
+            "Gamer", "Knight", "Viper", "Shadow", "Ghost", "Titan", "Alpha", "Omega",
+            "Zeus", "Frost", "Blaze", "Storm", "Rider", "Rogue", "Pixel", "Nexus",
+            "Quantum", "Vertex", "Slayer", "Mystic", "Cyber", "Hyper", "Sonic", "Laser",
+            "Gold", "Iron", "Steel", "Stone", "Rock", "Diamond", "Emerald", "Ruby"
     };
 
+    // Расширенный список суффиксов
     private static final String[] SUFFIXES = {
             "123", "321", "007", "999", "777", "2025", "xD", "Pro", "GG", "PvP",
-            "1337", "404", "HD", "YT", "X", "Z", "K", ""
+            "1337", "404", "HD", "YT", "X", "Z", "K", "V", "M", "N", "B", "Play", "Win",
+            "Master", "Boss", "King", "Lord", "Elite", "Prime", "Force", "Squad", "Zone"
     };
 
     private static final String CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
     private final Random random = new Random();
 
+    /**
+     * Пул генерации расширен. Координация стилей гарантирует 500,000+ вариаций.
+     * Ники никогда не закончатся, бот может держать сотни аккаунтов.
+     */
     public String generateNick() {
-        int style = random.nextInt(4);
+        int style = random.nextInt(5);
         return switch (style) {
-            case 0 -> PREFIXES[random.nextInt(PREFIXES.length)] + (random.nextInt(900) + 100);
+            case 0 -> PREFIXES[random.nextInt(PREFIXES.length)] + (random.nextInt(9000) + 1000);
             case 1 -> PREFIXES[random.nextInt(PREFIXES.length)] + SUFFIXES[random.nextInt(SUFFIXES.length)];
-            case 2 -> generateRandom(random.nextInt(4) + 5);
-            default -> PREFIXES[random.nextInt(PREFIXES.length)] +
+            case 2 -> generateRandom(random.nextInt(4) + 6); // Полный случайный буквенно-цифровой ник от 6 до 10 знаков
+            case 3 -> PREFIXES[random.nextInt(PREFIXES.length)] +
                     PREFIXES[random.nextInt(PREFIXES.length)].toLowerCase() +
                     (random.nextInt(90) + 10);
+            default -> PREFIXES[random.nextInt(PREFIXES.length)] + SUFFIXES[random.nextInt(SUFFIXES.length)] + (random.nextInt(90) + 10);
         };
     }
 
@@ -46,14 +57,14 @@ public class NicknameGenerator {
     }
 
     public String generateBankNick() {
-        String[] names = {"Vault", "Treasury", "Reserve", "Depot", "Bank", "Base", "Store"};
+        String[] names = {"Vault", "Treasury", "Reserve", "Depot", "Bank", "Base", "Store", "Safe", "Fort", "Secure"};
         return names[random.nextInt(names.length)] + (random.nextInt(900) + 100);
     }
 
     public List<String> generateUnique(int count, Set<String> existing) {
         List<String> result = new ArrayList<>();
         int attempts = 0;
-        while (result.size() < count && attempts < count * 20) {
+        while (result.size() < count && attempts < count * 100) {
             String nick = generateNick();
             attempts++;
             if (!existing.contains(nick) && !result.contains(nick) &&
@@ -63,10 +74,6 @@ public class NicknameGenerator {
         }
         return result;
     }
-
-    // ========================================================
-    //  ЗАГРУЗКА / СОЗДАНИЕ
-    // ========================================================
 
     public NickStorage loadOrCreate(int workerCount) {
         try {
@@ -94,29 +101,24 @@ public class NicknameGenerator {
         for (String line : lines) {
             line = line.trim();
 
-            // Пропускаем пустые строки и комментарии
             if (line.isEmpty() || line.startsWith("#")) {
                 continue;
             }
 
             if (bankNick == null) {
-                // Первая не-комментарий строка = банк
                 bankNick = line;
                 Secret.LOGGER.info("Loaded bank nick: '{}'", bankNick);
             } else {
-                // Остальные = твинки
                 workerNicks.add(line);
                 Secret.LOGGER.info("Loaded worker nick: '{}'", line);
             }
         }
 
-        // Если файл пустой или только комментарии
         if (bankNick == null || bankNick.isEmpty()) {
             Secret.LOGGER.warn("Nicks file has no valid nicks, creating new...");
             return null;
         }
 
-        // Добавляем твинков если не хватает
         if (workerNicks.size() < workerCount) {
             Set<String> existing = new HashSet<>(workerNicks);
             existing.add(bankNick);
@@ -143,16 +145,10 @@ public class NicknameGenerator {
         return new NickStorage(bankNick, workers);
     }
 
-    // ========================================================
-    //  СОХРАНЕНИЕ
-    // ========================================================
-
     public void saveToFile(String bankNick, List<String> workerNicks) {
         try {
             Files.createDirectories(NICKS_FILE.getParent());
 
-            // ВАЖНО: сначала банк, потом твинки
-            // Комментарии отдельно, не перемешивая с никами
             StringBuilder sb = new StringBuilder();
             sb.append("# Secret Farm - Ники\n");
             sb.append("# Формат: первая строка = банк, остальные = твинки\n");
@@ -203,10 +199,6 @@ public class NicknameGenerator {
         saveToFile(storage.bankNick(), storage.workerNicks());
         return newNick;
     }
-
-    // ========================================================
-    //  ХРАНИЛИЩЕ
-    // ========================================================
 
     public record NickStorage(String bankNick, List<String> workerNicks) {
         public NickStorage(String bankNick, List<String> workerNicks) {

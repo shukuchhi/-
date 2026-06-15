@@ -3,8 +3,6 @@ package org.vovochka.fun.secret.bot;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.TelegramBotsApi;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
-import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
@@ -17,6 +15,11 @@ import org.vovochka.fun.secret.ipc.IpcClient;
 import org.vovochka.fun.secret.ipc.IpcServer;
 
 import java.io.File;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Files;
 
 public class TelegramBotHandler extends TelegramLongPollingBot {
 
@@ -84,7 +87,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                 }
             }
             default -> {
-                // Только цифры = капча
                 if (text.matches("\\d+")) {
                     if (SecretClient.stateMachine != null) {
                         SecretClient.stateMachine.onCaptchaAnswer(text);
@@ -104,10 +106,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
             }
         }
     }
-
-    // ========================================================
-    //  ЗАПУСК / ОСТАНОВКА
-    // ========================================================
 
     public void startAsBank() {
         if (SecretClient.clientRole != SecretClient.ClientRole.UNKNOWN) {
@@ -183,10 +181,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
         sendMessage(myLabel + ": 🛑 Остановлен!");
     }
 
-    // ========================================================
-    //  СТАТУС
-    // ========================================================
-
     private void sendHelp() {
         sendMessage(
                 "🤖 " + myLabel + " - Secret Farm\n" +
@@ -250,10 +244,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
         sendMessage(sb.toString());
     }
 
-    // ========================================================
-    //  ОТПРАВКА С RETRY
-    // ========================================================
-
     public void sendMessage(String text) {
         for (int attempt = 1; attempt <= 3; attempt++) {
             try {
@@ -272,22 +262,61 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
         }
     }
 
+    /**
+     * Идеальный метод отправки фото через встроенный Java Native HttpClient.
+     * Полностью исключает NoClassDefFoundError для MultipartEntityBuilder в среде Fabric.
+     */
     public void sendPhoto(File file, String caption) {
         for (int attempt = 1; attempt <= 3; attempt++) {
             try {
-                SendPhoto p = new SendPhoto();
-                p.setChatId(String.valueOf(adminId));
-                p.setPhoto(new InputFile(file, file.getName()));
-                p.setCaption(caption);
-                execute(p);
-                return;
-            } catch (TelegramApiException e) {
-                Secret.LOGGER.error("[TG-{}] sendPhoto attempt {}/3: {}",
-                        ClientIdentity.getId(), attempt, e.getMessage());
-                if (attempt < 3) {
-                    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                String boundary = "Boundary-" + System.currentTimeMillis();
+                HttpClient client = HttpClient.newHttpClient();
+
+                byte[] fileBytes = Files.readAllBytes(file.toPath());
+                StringBuilder sb = new StringBuilder();
+
+                // Chat ID
+                sb.append("--").append(boundary).append("\r\n");
+                sb.append("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n");
+                sb.append(adminId).append("\r\n");
+
+                // Caption
+                if (caption != null) {
+                    sb.append("--").append(boundary).append("\r\n");
+                    sb.append("Content-Disposition: form-data; name=\"caption\"\r\n\r\n");
+                    sb.append(caption).append("\r\n");
                 }
+
+                // File
+                sb.append("--").append(boundary).append("\r\n");
+                sb.append("Content-Disposition: form-data; name=\"photo\"; filename=\"").append(file.getName()).append("\"\r\n");
+                sb.append("Content-Type: image/png\r\n\r\n");
+
+                byte[] headerBytes = sb.toString().getBytes("UTF-8");
+                byte[] footerBytes = ("\r\n--" + boundary + "--\r\n").getBytes("UTF-8");
+
+                byte[] multipartBody = new byte[headerBytes.length + fileBytes.length + footerBytes.length];
+                System.arraycopy(headerBytes, 0, multipartBody, 0, headerBytes.length);
+                System.arraycopy(fileBytes, 0, multipartBody, headerBytes.length, fileBytes.length);
+                System.arraycopy(footerBytes, 0, multipartBody, headerBytes.length + fileBytes.length, footerBytes.length);
+
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create("https://api.telegram.org/bot" + token + "/sendPhoto"))
+                        .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(multipartBody))
+                        .build();
+
+                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() == 200) {
+                    Secret.LOGGER.info("[TG] Native sendPhoto transfer complete on attempt {}", attempt);
+                    return;
+                } else {
+                    Secret.LOGGER.warn("[TG] Native sendPhoto rejected with code: {}", response.statusCode());
+                }
+            } catch (Exception e) {
+                Secret.LOGGER.error("[TG] Native sendPhoto crash on attempt {}/3: {}", attempt, e.getMessage());
             }
+            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
         }
     }
 }

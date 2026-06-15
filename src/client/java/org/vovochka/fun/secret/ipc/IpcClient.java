@@ -2,6 +2,7 @@ package org.vovochka.fun.secret.ipc;
 
 import org.vovochka.fun.secret.Secret;
 import org.vovochka.fun.secret.SecretClient;
+import org.vovochka.fun.secret.automation.WorkerBotStateMachine;
 
 import java.io.*;
 import java.net.*;
@@ -46,7 +47,6 @@ public class IpcClient {
                         new OutputStreamWriter(socket.getOutputStream()), true
                 );
 
-                // Представляемся банку
                 String myNick = SecretClient.accountManager != null
                         ? SecretClient.accountManager.getCurrentUsername()
                         : "WorkerUnknown";
@@ -60,7 +60,6 @@ public class IpcClient {
                     );
                 }
 
-                // Читаем сообщения от банка
                 String line;
                 while ((line = reader.readLine()) != null && shouldRun.get()) {
                     IpcMessage msg = IpcMessage.deserialize(line);
@@ -91,9 +90,6 @@ public class IpcClient {
         Secret.LOGGER.info("[IPC-Client] Connect loop ended.");
     }
 
-    /**
-     * Обработка сообщений от банка
-     */
     private void onMessageFromBank(IpcMessage msg) {
         switch (msg.type) {
             case HELLO_BANK -> {
@@ -110,6 +106,22 @@ public class IpcClient {
                 }
             }
 
+            case WORKER_CREATE_STAVKA -> {
+                if (SecretClient.stateMachine instanceof WorkerBotStateMachine workerMachine) {
+                    try {
+                        workerMachine.runWorkerCreateStavkaFlow(Integer.parseInt(msg.data.trim()));
+                    } catch (Exception e) {
+                        Secret.LOGGER.error("[IPC-Client] Failed parsing create amount: {}", msg.data);
+                    }
+                }
+            }
+
+            case BANK_CREATED_STAVKA -> {
+                if (SecretClient.stateMachine instanceof WorkerBotStateMachine workerMachine) {
+                    workerMachine.onBankCreatedStavkaNotification();
+                }
+            }
+
             case ACCEPT_STAVKA -> {
                 Secret.LOGGER.info("[IPC-Client] Bank accepted stavka!");
                 if (SecretClient.telegramBot != null) {
@@ -118,9 +130,7 @@ public class IpcClient {
             }
 
             case STAVKA_WIN -> {
-                Secret.LOGGER.info("[IPC-Client] Stavka WIN! Winner: {}", msg.data);
                 if (SecretClient.stateMachine != null) {
-                    // Оповещаем твинка о результате
                     SecretClient.stateMachine.transitionTo(
                             org.vovochka.fun.secret.automation.BotState.CYCLE_COMPLETE
                     );
@@ -128,7 +138,6 @@ public class IpcClient {
             }
 
             case STAVKA_LOSS -> {
-                Secret.LOGGER.info("[IPC-Client] Stavka LOSS. Winner: {}", msg.data);
                 if (SecretClient.stateMachine != null) {
                     SecretClient.stateMachine.transitionTo(
                             org.vovochka.fun.secret.automation.BotState.CYCLE_COMPLETE
@@ -143,9 +152,6 @@ public class IpcClient {
         }
     }
 
-    /**
-     * Отправить сообщение банку
-     */
     public void send(IpcMessage msg) {
         PrintWriter pw = this.writer;
         if (pw != null && connected.get()) {

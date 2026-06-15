@@ -21,6 +21,7 @@ import org.vovochka.fun.secret.ipc.IpcMessage;
 import org.vovochka.fun.secret.util.ChatHelper;
 import org.vovochka.fun.secret.util.ChatListener;
 
+import java.io.File;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -36,41 +37,44 @@ public class BankBotStateMachine extends BotStateMachine {
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private volatile BotState currentState = BotState.IDLE;
 
-    // АФК защита
     private ScheduledFuture<?> afkTask;
+    private ScheduledFuture<?> watchdogTask;
 
-    // Данные ставки от твинка
-    private volatile int pendingStavkaAmount = 0;
+    private volatile int myCC = -1;
+    private volatile int myCoins = -1;
+    private volatile int opponentCC = -1;
+    private volatile int targetRoundAmount = 0;
+
     private volatile String pendingWorkerNick = "";
-
-    // Данные банка
     private volatile boolean didFirstFarm = false;
-
-    // Анти-спам капча
     private volatile boolean captchaSent = false;
-
-    // КД между подключениями
     private volatile long lastConnectTime = 0;
 
-    // Координаты кейсов
+    private volatile boolean rewardReceived = false;
+    private volatile int interactionAttempts = 0;
+    private volatile String stavkaMenuStep = "idle";
+
     private static final BlockPos CASE_1 = new BlockPos(-15, 46, 153);
     private static final BlockPos CASE_2 = new BlockPos(-15, 46, 158);
 
-    // Обработчик чата
     private Consumer<String> chatHandler;
 
     public BankBotStateMachine() {
         registerChatListeners();
     }
 
-    // ========================================================
-    //  ПУБЛИЧНЫЕ МЕТОДЫ
-    // ========================================================
+    private void sendTelegramDebug(String msg) {
+        if (SecretClient.telegramBot != null) {
+            SecretClient.telegramBot.sendMessage("🏦 [БАНК] " + msg);
+        }
+    }
 
     @Override
     public void start() {
         if (isRunning.compareAndSet(false, true)) {
             Secret.LOGGER.info("[BANK] Starting...");
+            sendTelegramDebug("🚀 Кнопка старт нажата. Активация автомата...");
+            watchdogTask = scheduler.scheduleAtFixedRate(this::runConnectionWatchdog, 5, 5, TimeUnit.SECONDS);
             transitionTo(BotState.CONNECTING_TO_SERVER);
         }
     }
@@ -80,14 +84,26 @@ public class BankBotStateMachine extends BotStateMachine {
         isRunning.set(false);
         currentState = BotState.IDLE;
         stopAfkProtection();
+        if (watchdogTask != null) { watchdogTask.cancel(false); watchdogTask = null; }
         captchaSent = false;
-
-        if (chatHandler != null) {
-            ChatListener.removeHandler(chatHandler);
-            chatHandler = null;
-        }
-
+        if (chatHandler != null) { ChatListener.removeHandler(chatHandler); chatHandler = null; }
         Secret.LOGGER.info("[BANK] Stopped.");
+        sendTelegramDebug("🛑 Бот успешно остановлен пользователем.");
+    }
+
+    private void runConnectionWatchdog() {
+        if (!isRunning.get()) return;
+        if (currentState == BotState.IDLE || currentState == BotState.CONNECTING_TO_SERVER || currentState == BotState.BANNED) return;
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.currentScreen != null) {
+            String screenName = client.currentScreen.getClass().getSimpleName().toLowerCase();
+            if (screenName.contains("disconnect") || screenName.contains("kick")) {
+                Secret.LOGGER.warn("[WATCHDOG] Disconnect detected: {}", screenName);
+                sendTelegramDebug("⚠️ [ВАТЧДОГ] Зафиксировано отключение от сервера. Перенаправляю на смену IP...");
+                transitionTo(BotState.BANNED);
+            }
+        }
     }
 
     @Override
@@ -95,29 +111,21 @@ public class BankBotStateMachine extends BotStateMachine {
         if (!isRunning.get() && newState != BotState.IDLE) return;
         Secret.LOGGER.info("[BANK] {} -> {}", currentState, newState);
         currentState = newState;
+        sendTelegramDebug("🔄 Смена состояния -> " + newState.name());
 
+        final BotState capturedState = newState;
         scheduler.schedule(() -> {
             try {
-                handleState(newState);
+                if (currentState != capturedState || !isRunning.get()) return;
+                handleState(capturedState);
             } catch (Exception e) {
-                Secret.LOGGER.error("[BANK] Error in {}: {}", newState, e.getMessage(), e);
-                if (SecretClient.telegramBot != null) {
-                    SecretClient.telegramBot.sendMessage(
-                            "[БАНК] ❌ Ошибка: " + e.getMessage());
-                }
+                sendTelegramDebug("❌ Ошибка в " + capturedState.name() + ": " + e.getMessage());
             }
         }, getDelay(newState), TimeUnit.MILLISECONDS);
     }
 
-    @Override
-    public BotState getCurrentState() { return currentState; }
-
-    @Override
-    public boolean isRunning() { return isRunning.get(); }
-
-    // ========================================================
-    //  ОБРАБОТКА СОСТОЯНИЙ
-    // ========================================================
+    @Override public BotState getCurrentState() { return currentState; }
+    @Override public boolean isRunning() { return isRunning.get(); }
 
     private void handleState(BotState state) {
         MinecraftClient client = MinecraftClient.getInstance();
@@ -126,588 +134,407 @@ public class BankBotStateMachine extends BotStateMachine {
             case JOINING_QUEUE        -> doJoinQueue(client);
             case WAITING_SPAWN        -> doOnSpawn(client);
             case WRITING_FREE         -> doWriteFree(client);
-            case WALKING_TO_CASE_1    -> doWalkToCase(client, CASE_1, BotState.OPENING_CASE_1);
-            case WALKING_TO_CASE_2    -> doWalkToCase(client, CASE_2, BotState.OPENING_CASE_2);
-            case ACCEPTING_STAVKA     -> doAcceptStavka(client);
+            case WALKING_TO_CASE_1    -> { interactionAttempts = 0; rewardReceived = false; doWalkToCase(client, CASE_1, BotState.OPENING_CASE_1); }
+            case WALKING_TO_CASE_2    -> { interactionAttempts = 0; rewardReceived = false; doWalkToCase(client, CASE_2, BotState.OPENING_CASE_2); }
             case BANNED               -> doBanned();
             default -> Secret.LOGGER.info("[BANK] Waiting in: {}", state);
         }
     }
 
-    private long getDelay(BotState state) {
-        return switch (state) {
-            case CONNECTING_TO_SERVER -> 1000;
-            case WAITING_SPAWN        -> 3000;
-            case WRITING_FREE         -> 2000;
-            default                   -> 800;
-        };
-    }
-
-    // ========================================================
-    //  ДЕЙСТВИЯ
-    // ========================================================
-
     private void doConnect(MinecraftClient client) {
-        // КД 5 секунд между подключениями
         long now = System.currentTimeMillis();
-        long timeSinceLast = now - lastConnectTime;
-        if (timeSinceLast < 5000) {
-            long wait = 5000 - timeSinceLast;
-            Secret.LOGGER.info("[BANK] Connect cooldown {}ms...", wait);
-            scheduler.schedule(() -> doConnect(client), wait, TimeUnit.MILLISECONDS);
+        if (now - lastConnectTime < 5000) {
+            scheduler.schedule(() -> {
+                if (currentState == BotState.CONNECTING_TO_SERVER && isRunning.get()) doConnect(client);
+            }, 5000 - (now - lastConnectTime), TimeUnit.MILLISECONDS);
             return;
         }
         lastConnectTime = now;
         captchaSent = false;
-
-        Secret.LOGGER.info("[BANK] Connecting to {}...", Secret.SERVER_IP);
-        if (SecretClient.telegramBot != null) {
-            SecretClient.telegramBot.sendMessage("🔗 БАНК: Подключаюсь...");
-        }
-
+        sendTelegramDebug("🔗 Подключаюсь к серверу: " + Secret.SERVER_IP);
         try {
             ServerAddress addr = ServerAddress.parse(Secret.SERVER_IP);
-            ServerInfo info = new ServerInfo(
-                    "CountryMC", Secret.SERVER_IP, ServerInfo.ServerType.OTHER
-            );
-            client.execute(() -> {
-                try {
-                    ConnectScreen.connect(
-                            client.currentScreen, client, addr, info, false, null);
-                } catch (Exception e) {
-                    Secret.LOGGER.error("[BANK] ConnectScreen error: {}", e.getMessage());
-                    transitionTo(BotState.BANNED);
-                }
-            });
-
-            scheduler.schedule(() -> {
-                if (client.world == null || client.player == null) {
-                    Secret.LOGGER.warn("[BANK] Not connected after 30s");
-                    transitionTo(BotState.BANNED);
-                }
-            }, 30, TimeUnit.SECONDS);
-
-        } catch (Exception e) {
-            Secret.LOGGER.error("[BANK] Connect error: {}", e.getMessage());
-            transitionTo(BotState.BANNED);
-        }
+            ServerInfo info = new ServerInfo("CountryMC", Secret.SERVER_IP, ServerInfo.ServerType.OTHER);
+            info.setResourcePackPolicy(ServerInfo.ResourcePackPolicy.ENABLED);
+            client.execute(() -> ConnectScreen.connect(client.currentScreen, client, addr, info, false, null));
+        } catch (Exception e) { transitionTo(BotState.BANNED); }
     }
 
     private void doJoinQueue(MinecraftClient client) {
         sendChat(client, "/joinq sirius");
-        scheduler.schedule(() -> transitionTo(BotState.WAITING_SPAWN), 7, TimeUnit.SECONDS);
+        scheduler.schedule(() -> {
+            if (currentState == BotState.JOINING_QUEUE && isRunning.get()) {
+                transitionTo(BotState.WAITING_SPAWN);
+            }
+        }, 7, TimeUnit.SECONDS);
     }
 
     private void doOnSpawn(MinecraftClient client) {
         startAfkProtection(client);
-
         if (!didFirstFarm) {
-            Secret.LOGGER.info("[BANK] First time - doing /free farm");
-            if (SecretClient.telegramBot != null) {
-                SecretClient.telegramBot.sendMessage("🏦 Банк на сервере! Фармлю /free...");
-            }
-            scheduler.schedule(() -> transitionTo(BotState.WRITING_FREE), 2, TimeUnit.SECONDS);
+            transitionTo(BotState.WRITING_FREE);
         } else {
-            Secret.LOGGER.info("[BANK] On spawn, waiting for worker...");
-            if (SecretClient.telegramBot != null) {
-                SecretClient.telegramBot.sendMessage(
-                        "🏦 Банк на сервере! Жду ставок от твинка...");
-            }
-            if (SecretClient.ipcServer != null) {
-                SecretClient.ipcServer.send(new IpcMessage(IpcMessage.Type.BANK_READY, ""));
-            }
-            currentState = BotState.IDLE;
+            startStavkaEngine();
         }
     }
 
     private void doWriteFree(MinecraftClient client) {
-        if (client.player == null) {
-            scheduler.schedule(() -> transitionTo(BotState.WRITING_FREE), 2, TimeUnit.SECONDS);
-            return;
-        }
         sendChat(client, "/free");
         currentState = BotState.HANDLING_FREE_MENU_1;
     }
 
     private void doWalkToCase(MinecraftClient client, BlockPos target, BotState nextState) {
         if (client.player == null) return;
-
-        client.execute(() -> {
-            if (client.player == null) return;
-            Vec3d tv = Vec3d.ofCenter(target);
-            Vec3d ep = client.player.getEyePos();
-            Vec3d dir = tv.subtract(ep).normalize();
-            client.player.setYaw((float) Math.toDegrees(Math.atan2(-dir.x, dir.z)));
-            client.player.setPitch((float) Math.toDegrees(
-                    -Math.asin(Math.max(-1, Math.min(1, dir.y)))));
-        });
+        sendTelegramDebug("🚶 [ПУТЬ] Начинаю активное движение к блоку: " + target.toShortString());
 
         final int[] ticks = {0};
+        final int[] stuckTicks = {0};
+        final Vec3d[] lastPos = {client.player.getPos()};
+        final BotState expectedState = currentState;
         AtomicReference<ScheduledFuture<?>> taskRef = new AtomicReference<>();
 
         ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(() -> {
-            if (client.player == null) return;
-            ticks[0]++;
+            client.execute(() -> {
+                if (!isRunning.get() || currentState != expectedState) {
+                    ScheduledFuture<?> f = taskRef.get();
+                    if (f != null) f.cancel(false);
+                    return;
+                }
+                if (client.player == null || client.interactionManager == null) return;
+                ticks[0]++;
+                Vec3d pos = client.player.getPos();
+                double dx = target.getX() + 0.5 - pos.x, dz = target.getZ() + 0.5 - pos.z;
+                double dist = Math.sqrt(dx * dx + dz * dz);
 
-            Vec3d pos = client.player.getPos();
-            double dx = target.getX() + 0.5 - pos.x;
-            double dz = target.getZ() + 0.5 - pos.z;
-            double dist = Math.sqrt(dx * dx + dz * dz);
+                if (ticks[0] % 10 == 0) {
+                    if (pos.distanceTo(lastPos[0]) < 0.05) {
+                        stuckTicks[0]++;
+                        if (stuckTicks[0] >= 2) { client.player.jump(); stuckTicks[0] = 0; }
+                    } else { stuckTicks[0] = 0; }
+                    lastPos[0] = pos;
+                }
 
-            if (dist < 3.5 || ticks[0] > 80) {
-                ScheduledFuture<?> f = taskRef.get();
-                if (f != null) f.cancel(false);
+                if (dist < 2.0 || ticks[0] > 140) {
+                    ScheduledFuture<?> f = taskRef.get();
+                    if (f != null) f.cancel(false);
 
-                client.execute(() -> {
-                    if (client.player == null || client.interactionManager == null) return;
                     client.options.forwardKey.setPressed(false);
-                    BlockHitResult hit = new BlockHitResult(
-                            Vec3d.ofCenter(target), Direction.UP, target, false);
-                    client.interactionManager.interactBlock(
-                            client.player, Hand.MAIN_HAND, hit);
-                    currentState = nextState;
-                    Secret.LOGGER.info("[BANK] Interacted with block at {}", target);
-                });
-            } else {
-                client.execute(() -> {
-                    if (client.player == null) return;
-                    float yaw = (float)(Math.toDegrees(Math.atan2(dz, dx)) - 90);
-                    client.player.setYaw(yaw);
-                    client.options.forwardKey.setPressed(true);
-                });
-            }
-        }, 0, 200, TimeUnit.MILLISECONDS);
+                    Vec3d center = Vec3d.ofCenter(target);
+                    client.player.setYaw((float)(Math.toDegrees(Math.atan2(center.z - client.player.getZ(), center.x - client.player.getX())) - 90));
+                    client.player.setPitch((float)(-Math.toDegrees(Math.atan2(center.y - client.player.getEyeY(), Math.sqrt((center.x - client.player.getX())*(center.x - client.player.getX()) + (center.z - client.player.getZ())*(center.z - client.player.getZ()))))));
+                    client.interactionManager.interactBlock(client.player, Hand.MAIN_HAND, new BlockHitResult(center, Direction.UP, target, false));
 
+                    currentState = nextState;
+                    sendTelegramDebug("🔄 Смена состояния -> " + nextState.name());
+                    sendTelegramDebug("🎬 Кейс активирован ПКМ. Ожидаю 10 секунд завершения серверной анимации рулетки...");
+
+                    scheduler.schedule(() -> {
+                        if (isRunning.get() && currentState == nextState) {
+                            verifyCaseReward(target, nextState);
+                        }
+                    }, 10000, TimeUnit.MILLISECONDS);
+                } else {
+                    client.player.setYaw((float)(Math.toDegrees(Math.atan2(dz, dx)) - 90));
+                    client.options.forwardKey.setPressed(true);
+                }
+            });
+        }, 0, 50, TimeUnit.MILLISECONDS);
         taskRef.set(task);
     }
 
-    private void doAcceptStavka(MinecraftClient client) {
-        Secret.LOGGER.info("[BANK] Accepting stavka {} KK from {}",
-                pendingStavkaAmount, pendingWorkerNick);
-        sendChat(client, "/stavka");
+    private void verifyCaseReward(BlockPos target, BotState nextState) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> { if (client.player != null) client.player.closeHandledScreen(); });
 
-        scheduler.schedule(() -> {
-            MinecraftClient mc = MinecraftClient.getInstance();
-            if (!(mc.currentScreen instanceof HandledScreen<?> s)) {
-                scheduler.schedule(() -> doAcceptStavka(mc), 3, TimeUnit.SECONDS);
-                return;
-            }
-            clickSlot(s, 11); // Посмотреть ставки
-
-            scheduler.schedule(() -> {
-                if (!(mc.currentScreen instanceof HandledScreen<?> s2)) return;
-                int slot = findStavkaSlot(s2, pendingWorkerNick, pendingStavkaAmount);
-
-                if (slot < 0) {
-                    mc.execute(() -> { if (mc.currentScreen != null) mc.currentScreen = null; });
-                    scheduler.schedule(() -> doAcceptStavka(mc), 5, TimeUnit.SECONDS);
-                    return;
-                }
-
-                clickSlot(s2, slot);
-                scheduler.schedule(() -> {
-                    if (!(mc.currentScreen instanceof HandledScreen<?> s3)) return;
-                    clickSlot(s3, 11); // Подтвердить
-                    if (SecretClient.ipcServer != null) {
-                        SecretClient.ipcServer.send(
-                                new IpcMessage(IpcMessage.Type.ACCEPT_STAVKA, ""));
-                    }
-                    currentState = BotState.IDLE;
-                }, 1, TimeUnit.SECONDS);
-
-            }, 2, TimeUnit.SECONDS);
-        }, 2, TimeUnit.SECONDS);
-    }
-
-    private void doBanned() {
-        stopAfkProtection();
-        captchaSent = false;
-
-        if (SecretClient.telegramBot != null) {
-            SecretClient.telegramBot.sendMessage(
-                    "🚫 БАНК: Подозрительная активность! Меняю IP...");
-        }
-
-        new Thread(() -> {
-            boolean ok = SecretClient.vpnController.changeIp();
-            if (ok) {
-                if (SecretClient.telegramBot != null) {
-                    SecretClient.telegramBot.sendMessage(
-                            "✅ IP сменён! Жду 10 секунд перед переподключением...");
-                }
-                // 10 секунд после смены VPN
-                try { Thread.sleep(10000); } catch (InterruptedException ignored) {}
-
-                SecretClient.accountManager.switchToBank();
-                transitionTo(BotState.CONNECTING_TO_SERVER);
+        if (rewardReceived) {
+            sendTelegramDebug("✅ 10 секунд анимации истекли, чат подтвердил получение награды банка.");
+            if (nextState == BotState.OPENING_CASE_1) {
+                transitionTo(BotState.WALKING_TO_CASE_2);
             } else {
-                if (SecretClient.telegramBot != null) {
-                    SecretClient.telegramBot.sendMessage("❌ Не удалось сменить IP! Жду 30с...");
-                }
-                scheduler.schedule(() -> doBanned(), 30, TimeUnit.SECONDS);
+                didFirstFarm = true;
+                startStavkaEngine();
             }
-        }, "Bank-VPN-Thread").start();
-    }
+            return;
+        }
 
-    // ========================================================
-    //  АФК ЗАЩИТА
-    // ========================================================
-
-    private void startAfkProtection(MinecraftClient client) {
-        stopAfkProtection();
-        afkTask = scheduler.scheduleAtFixedRate(() -> {
-            client.execute(() -> {
-                if (client.player == null) return;
-                // Прыжок каждые 50 секунд
-                client.player.jump();
-                Secret.LOGGER.debug("[BANK] AFK jump");
-            });
-        }, 50, 50, TimeUnit.SECONDS);
-        Secret.LOGGER.info("[BANK] AFK protection started");
-    }
-
-    private void stopAfkProtection() {
-        if (afkTask != null && !afkTask.isCancelled()) {
-            afkTask.cancel(false);
-            afkTask = null;
+        interactionAttempts++;
+        if (interactionAttempts < 3) {
+            sendTelegramDebug("⚠️ Награда не найдена за 10 секунд. Повторная попытка открытия кейса #" + (interactionAttempts + 1));
+            currentState = (nextState == BotState.OPENING_CASE_1) ? BotState.WALKING_TO_CASE_1 : BotState.WALKING_TO_CASE_2;
+            doWalkToCase(client, target, nextState);
+        } else {
+            sendTelegramDebug("❌ Все попытки открытия исчерпаны. Пропускаю блок кейса.");
+            if (nextState == BotState.OPENING_CASE_1) transitionTo(BotState.WALKING_TO_CASE_2);
+            else { didFirstFarm = true; startStavkaEngine(); }
         }
     }
 
-    // ========================================================
-    //  GUI
-    // ========================================================
+    private void updateBalancesFromScoreboard() {
+        try {
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client.world == null) return;
+            var scoreboard = client.world.getScoreboard();
+            var objective = scoreboard.getObjectiveForSlot(net.minecraft.scoreboard.ScoreboardDisplaySlot.SIDEBAR);
+            if (objective == null) return;
+
+            for (var entry : scoreboard.getScoreboardEntries(objective)) {
+                String clean = ChatHelper.stripColors(entry.name().getString()).toLowerCase().trim();
+                if (clean.contains("баланс")) {
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\d+").matcher(clean);
+                    java.util.List<Integer> numbers = new java.util.ArrayList<>();
+                    while (m.find()) {
+                        numbers.add(Integer.parseInt(m.group()));
+                    }
+                    if (numbers.size() >= 2) {
+                        this.myCoins = numbers.get(0);
+                        this.myCC = numbers.get(1);
+                        return;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Secret.LOGGER.error("Scoreboard parsing fail: {}", e.getMessage());
+        }
+    }
+
+    private void startStavkaEngine() {
+        didFirstFarm = true;
+        updateBalancesFromScoreboard();
+
+        sendTelegramDebug("📊 Мой баланс доната: " + myCC + " CC. Баланс монет: " + myCoins);
+        if (SecretClient.ipcServer != null) {
+            SecretClient.ipcServer.send(new IpcMessage(IpcMessage.Type.BANK_READY, myCC + "|" + myCoins));
+        }
+        currentState = BotState.IDLE;
+    }
+
+    public void syncFromWorker(int workerCC, int workerCoins) {
+        this.opponentCC = workerCC;
+        this.pendingWorkerNick = SecretClient.accountManager.getCurrentWorkerNick();
+
+        updateBalancesFromScoreboard();
+        targetRoundAmount = Math.min(myCC, opponentCC);
+
+        sendTelegramDebug("🎲 Синхронизация раунда: Банк (" + myCC + " CC) vs Твинк (" + opponentCC + " CC). Целевая ставка: " + targetRoundAmount + " CC.");
+
+        if (targetRoundAmount <= 0) {
+            sendTelegramDebug("🏁 Передача донат-валюты окончена. Баланс обнулен.");
+            if (myCC == 0 && myCoins > 0) {
+                sendTelegramDebug("💸 Передаю монеты твинку: /pay " + pendingWorkerNick + " " + myCoins);
+                sendChat(MinecraftClient.getInstance(), "/pay " + pendingWorkerNick + " " + myCoins);
+            }
+            return;
+        }
+
+        if (myCC <= opponentCC) {
+            sendTelegramDebug("🎰 У меня меньше CC. Создаю ставку " + targetRoundAmount + " CC...");
+            stavkaMenuStep = "click_create";
+            sendChat(MinecraftClient.getInstance(), "/stavka");
+        } else {
+            sendTelegramDebug("⏳ У Твинка меньше CC. Ожидаю, пока он выставит ставку...");
+            if (SecretClient.ipcServer != null) {
+                SecretClient.ipcServer.send(new IpcMessage(IpcMessage.Type.WORKER_CREATE_STAVKA, String.valueOf(targetRoundAmount)));
+            }
+        }
+    }
+
+    public void onWorkerCreatedStavkaFromIpc() {
+        sendTelegramDebug("📩 Твинк выставил ставку. Пишу /stavka для принятия...");
+        stavkaMenuStep = "click_view";
+        sendChat(MinecraftClient.getInstance(), "/stavka");
+    }
 
     @Override
     public void onScreenOpened(HandledScreen<?> screen) {
         scheduler.schedule(() -> {
+            MinecraftClient client = MinecraftClient.getInstance();
             switch (currentState) {
-                case HANDLING_FREE_MENU_1 -> {
-                    Secret.LOGGER.info("[BANK] Free menu 1 - clicking slot 24");
-                    clickSlot(screen, 24);
-                    currentState = BotState.HANDLING_FREE_MENU_2;
-                }
+                case HANDLING_FREE_MENU_1 -> { clickSlot(screen, 23); currentState = BotState.HANDLING_FREE_MENU_2; }
                 case HANDLING_FREE_MENU_2 -> {
-                    Secret.LOGGER.info("[BANK] Free menu 2 - clicking slot 16");
-                    clickSlot(screen, 16);
+                    clickSlot(screen, 15);
+                    client.execute(() -> { if (client.player != null) client.player.closeHandledScreen(); });
+                    transitionTo(BotState.WALKING_TO_CASE_1);
                 }
                 case OPENING_CASE_1 -> {
-                    Secret.LOGGER.info("[BANK] Case 1 menu - clicking slot 11");
-                    clickSlot(screen, 11);
-                    scheduler.schedule(() ->
-                            transitionTo(BotState.WALKING_TO_CASE_2), 3, TimeUnit.SECONDS);
+                    sendTelegramDebug("🖱️ Кликаю слот 10 для запуска рулетки Кейса 1. Оставляю инвентарь открытым.");
+                    clickSlot(screen, 10);
                 }
                 case OPENING_CASE_2 -> {
-                    Secret.LOGGER.info("[BANK] Case 2 menu - clicking slot 11");
-                    clickSlot(screen, 11);
-                    scheduler.schedule(() -> {
-                        didFirstFarm = true;
-                        if (SecretClient.telegramBot != null) {
-                            SecretClient.telegramBot.sendMessage(
-                                    "🏦 Банк пофармил! Жду ставок от твинка...");
-                        }
-                        if (SecretClient.ipcServer != null) {
-                            SecretClient.ipcServer.send(
-                                    new IpcMessage(IpcMessage.Type.BANK_READY, ""));
-                        }
-                        currentState = BotState.IDLE;
-                    }, 3, TimeUnit.SECONDS);
+                    sendTelegramDebug("🖱️ Кликаю слот 10 для запуска рулетки Кейса 2. Оставляю инвентарь открытым.");
+                    clickSlot(screen, 10);
                 }
-                default -> {}
+                default -> handleStavkaGuiFlow(screen, client);
             }
-        }, 600, TimeUnit.MILLISECONDS);
+        }, 950, TimeUnit.MILLISECONDS);
     }
 
-    // ========================================================
-    //  IPC КОЛБЭКИ
-    // ========================================================
-
-    @Override
-    public void onWorkerCreatedStavka(String workerNick, int amount) {
-        pendingWorkerNick = workerNick;
-        pendingStavkaAmount = amount;
-        transitionTo(BotState.ACCEPTING_STAVKA);
-    }
-
-    @Override
-    public void onBankConnected(String bankNick) {}
-
-    @Override
-    public void onBankReady() {}
-
-    // ========================================================
-    //  КАПЧА
-    // ========================================================
-
-    @Override
-    public void onCaptchaAnswer(String answer) {
-        Secret.LOGGER.info("[BANK] Captcha answer received: {}", answer);
-        captchaSent = false;
-        sendChat(MinecraftClient.getInstance(), answer);
-    }
-
-    // ========================================================
-    //  ЧАТ
-    // ========================================================
-
-    private void registerChatListeners() {
-        chatHandler = this::onBankChat;
-        ChatListener.addHandler(chatHandler);
-        Secret.LOGGER.info("[BANK] Chat handler registered");
-    }
-
-    private void onBankChat(String raw) {
-        if (!isRunning.get()) return;
-
-        // Убираем форматирование и нормализуем
-        String clean = ChatHelper.stripColors(raw)
-                .replace("\\n", "")
-                .replace("\n", "")
-                .toLowerCase()
-                .trim();
-
-        if (clean.isEmpty()) return;
-
-        Secret.LOGGER.debug("[BANK-CHAT] Processing: '{}'", clean);
-
-        MinecraftClient client = MinecraftClient.getInstance();
-
-        // ===== КАПЧА =====
-        boolean isCaptcha = clean.contains("введи цифры") ||
-                clean.contains("введите цифры") ||
-                (clean.contains("цифры") && clean.contains("картинки")) ||
-                (clean.contains("цифры") && clean.contains("чат"));
-
-        if (isCaptcha) {
-            Secret.LOGGER.info("[BANK] ✅ CAPTCHA DETECTED! captchaSent={}", captchaSent);
-            if (!captchaSent) {
-                captchaSent = true;
-                captureAndSendScreenshot(client, "[БАНК]");
-            }
-            return;
-        }
-
-        // ===== АВТОРИЗАЦИЯ =====
-        boolean needAuth = clean.contains("авторизуйт") ||
-                clean.contains("авторизуйс") ||
-                clean.contains("введите пароль") ||
-                (clean.contains("/l ") && clean.length() < 50);
-
-        if (needAuth) {
-            captchaSent = false;
-            Secret.LOGGER.info("[BANK] Auth required");
-            scheduler.schedule(() ->
-                    sendChat(client, "/l " + Secret.BANK_PASSWORD), 1, TimeUnit.SECONDS);
-            return;
-        }
-
-        // ===== РЕГИСТРАЦИЯ =====
-        boolean needReg = clean.contains("зарегистрируйт") ||
-                clean.contains("зарегистрируйс") ||
-                clean.contains("не зарегистрирован") ||
-                (clean.contains("/reg ") && clean.length() < 50);
-
-        if (needReg) {
-            captchaSent = false;
-            Secret.LOGGER.info("[BANK] Registration required");
-            scheduler.schedule(() ->
-                            sendChat(client, "/reg " + Secret.BANK_PASSWORD + " " + Secret.BANK_PASSWORD),
-                    1, TimeUnit.SECONDS);
-            return;
-        }
-
-        // ===== ДОБРО ПОЖАЛОВАТЬ =====
-        if (clean.contains("добро пожаловать") || clean.contains("welcome")) {
-            captchaSent = false;
-            Secret.LOGGER.info("[BANK] Welcome! Joining queue...");
-            transitionTo(BotState.JOINING_QUEUE);
-            return;
-        }
-
-        // ===== МОНЕТЫ (после /free) =====
-        if (clean.contains("50") &&
-                (clean.contains("монет") || clean.contains("coin")) &&
-                !didFirstFarm) {
-            Secret.LOGGER.info("[BANK] Got 50 coins! Walking to cases...");
-            transitionTo(BotState.WALKING_TO_CASE_1);
-            return;
-        }
-
-        // ===== СТАВКА ВЫИГРАНА =====
-        if (clean.contains("твоя ставка") && clean.contains("выиграла")) {
-            Secret.LOGGER.info("[BANK] Stavka WON!");
-            if (SecretClient.telegramBot != null) {
-                SecretClient.telegramBot.sendMessage("🎉 БАНК выиграл ставку!");
-            }
-            if (SecretClient.ipcServer != null) {
-                SecretClient.ipcServer.send(new IpcMessage(IpcMessage.Type.STAVKA_WIN, "bank"));
-            }
-            return;
-        }
-
-        // ===== СТАВКА ПРОИГРАНА =====
-        if (clean.contains("ставка игрока") && clean.contains("выиграла")) {
-            Secret.LOGGER.info("[BANK] Stavka LOST!");
-            String winner = ChatHelper.extractNick(raw);
-            if (SecretClient.telegramBot != null) {
-                SecretClient.telegramBot.sendMessage("💸 БАНК проиграл! Выиграл: " + winner);
-            }
-            if (SecretClient.ipcServer != null) {
-                SecretClient.ipcServer.send(new IpcMessage(
-                        IpcMessage.Type.STAVKA_LOSS, winner != null ? winner : ""));
-            }
-            return;
-        }
-
-        // ===== КИК / БАН =====
-        if (clean.contains("подозрительн") ||
-                clean.contains("заблокирован") ||
-                clean.contains("проверка не пройдена") ||
-                clean.contains("banned")) {
-            captchaSent = false;
-            Secret.LOGGER.info("[BANK] Kicked/banned!");
-            transitionTo(BotState.BANNED);
-        }
-    }
-
-    // ========================================================
-    //  СКРИНШОТ
-    // ========================================================
-
-    private void captureAndSendScreenshot(MinecraftClient client, String prefix) {
-        scheduler.schedule(() -> {
-            client.execute(() -> {
-                try {
-                    Secret.LOGGER.info("{} Taking screenshot...", prefix);
-                    net.minecraft.client.util.ScreenshotRecorder.saveScreenshot(
-                            client.runDirectory,
-                            client.getFramebuffer(),
-                            (text) -> {
-                                Secret.LOGGER.info("{} Screenshot saved: {}", prefix,
-                                        text.getString());
-                                scheduler.schedule(() ->
-                                                sendLatestScreenshot(client, prefix),
-                                        1000, TimeUnit.MILLISECONDS);
-                            }
-                    );
-                } catch (Exception e) {
-                    Secret.LOGGER.error("{} Screenshot error: {}", prefix, e.getMessage());
-                    if (SecretClient.telegramBot != null) {
-                        SecretClient.telegramBot.sendMessage(
-                                prefix + " ❌ Не удалось сделать скриншот!\n" +
-                                        "Введите цифры капчи вручную:");
-                    }
+    private void handleStavkaGuiFlow(HandledScreen<?> screen, MinecraftClient client) {
+        if (stavkaMenuStep.equals("click_create")) {
+            sendTelegramDebug("🖱️ Клик слот 14 (Создать ставку)");
+            clickSlot(screen, 14);
+            stavkaMenuStep = "click_currency";
+        } else if (stavkaMenuStep.equals("click_currency")) {
+            sendTelegramDebug("静态 Клик слот 51 (Выбор донат валюты)");
+            clickSlot(screen, 51);
+            stavkaMenuStep = "adjust_amount";
+        } else if (stavkaMenuStep.equals("adjust_amount")) {
+            int current = 5;
+            int diff = targetRoundAmount - current;
+            long delay = 0;
+            if (diff > 0) {
+                for (int i = 0; i < diff; i++) {
+                    scheduler.schedule(() -> { clickSlot(screen, 14); }, delay, TimeUnit.MILLISECONDS);
+                    delay += 200;
                 }
-            });
-        }, 300, TimeUnit.MILLISECONDS);
-    }
-
-    private void sendLatestScreenshot(MinecraftClient client, String prefix) {
-        try {
-            java.io.File dir = new java.io.File(client.runDirectory, "screenshots");
-            if (!dir.exists()) {
-                Secret.LOGGER.warn("{} Screenshots dir not found: {}",
-                        prefix, dir.getAbsolutePath());
-                if (SecretClient.telegramBot != null) {
-                    SecretClient.telegramBot.sendMessage(
-                            prefix + " ❌ Папка скриншотов не найдена!");
+            } else if (diff < 0) {
+                for (int i = 0; i < Math.abs(diff); i++) {
+                    scheduler.schedule(() -> { clickSlot(screen, 13); }, delay, TimeUnit.MILLISECONDS);
+                    delay += 200;
                 }
-                return;
             }
-
-            java.io.File[] files = dir.listFiles(
-                    f -> f.isFile() && f.getName().endsWith(".png"));
-
-            if (files == null || files.length == 0) {
-                Secret.LOGGER.warn("{} No screenshots found", prefix);
-                if (SecretClient.telegramBot != null) {
-                    SecretClient.telegramBot.sendMessage(
-                            prefix + " ❌ Скриншот не найден! Введите цифры:");
+            scheduler.schedule(() -> {
+                sendTelegramDebug("静态 Клик слот 26 (Подтвердить ставку)");
+                clickSlot(screen, 26);
+                stavkaMenuStep = "idle";
+                client.execute(() -> { if (client.player != null) client.player.closeHandledScreen(); });
+                if (SecretClient.ipcServer != null) {
+                    SecretClient.ipcServer.send(new IpcMessage(IpcMessage.Type.BANK_CREATED_STAVKA, ""));
                 }
-                return;
-            }
+            }, delay + 300, TimeUnit.MILLISECONDS);
 
-            // Берём самый новый
-            java.io.File latest = files[0];
-            for (java.io.File f : files) {
-                if (f.lastModified() > latest.lastModified()) latest = f;
+        } else if (stavkaMenuStep.equals("click_view")) {
+            sendTelegramDebug("🖱️ Клик слот 11 (Посмотреть ставки)");
+            clickSlot(screen, 11);
+            stavkaMenuStep = "find_bet";
+        } else if (stavkaMenuStep.equals("find_bet")) {
+            int targetSlot = findStavkaSlot(screen, pendingWorkerNick, targetRoundAmount);
+            if (targetSlot != -1) {
+                sendTelegramDebug("✅ Ставка твинка найдена в слоте " + targetSlot + ". Нажимаю...");
+                clickSlot(screen, targetSlot);
+                stavkaMenuStep = "confirm_accept";
+            } else {
+                sendTelegramDebug("❌ Не удалось найти ставку твинка в слотах 10-16. Закрываю.");
+                client.execute(() -> { if (client.player != null) client.player.closeHandledScreen(); });
+                stavkaMenuStep = "idle";
             }
-
-            long age = System.currentTimeMillis() - latest.lastModified();
-            Secret.LOGGER.info("{} Sending: {} ({}ms old)", prefix, latest.getName(), age);
-
-            if (SecretClient.telegramBot != null) {
-                SecretClient.telegramBot.sendPhoto(
-                        latest,
-                        prefix + " 🔐 КАПЧА!\n" +
-                                "Аккаунт: " + SecretClient.accountManager.getCurrentUsername() + "\n" +
-                                "Введите цифры в ответ!"
-                );
-            }
-        } catch (Exception e) {
-            Secret.LOGGER.error("{} sendLatestScreenshot error: {}", prefix, e.getMessage());
+        } else if (stavkaMenuStep.equals("confirm_accept")) {
+            sendTelegramDebug("🖱️ Клик слот 11 (Подтвердить принятие)");
+            clickSlot(screen, 11);
+            stavkaMenuStep = "idle";
+            client.execute(() -> { if (client.player != null) client.player.closeHandledScreen(); });
         }
     }
 
-    // ========================================================
-    //  УТИЛИТЫ
-    // ========================================================
-
-    private void clickSlot(HandledScreen<?> screen, int slot) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        client.execute(() -> {
-            try {
-                ScreenHandler handler = screen.getScreenHandler();
-                if (slot >= handler.slots.size()) {
-                    Secret.LOGGER.warn("[BANK] Slot {} OOB ({})", slot, handler.slots.size());
-                    return;
-                }
-                client.interactionManager.clickSlot(
-                        handler.syncId, slot, 0, SlotActionType.PICKUP, client.player);
-                Secret.LOGGER.info("[BANK] Clicked slot {}", slot);
-            } catch (Exception e) {
-                Secret.LOGGER.error("[BANK] clickSlot error: {}", e.getMessage());
-            }
-        });
-    }
-
-    private int findStavkaSlot(HandledScreen<?> screen, String workerNick, int amount) {
+    private int findStavkaSlot(HandledScreen<?> screen, String nick, int amount) {
         ScreenHandler handler = screen.getScreenHandler();
-        for (int slot = 11; slot <= 17; slot++) {
+        for (int slot = 10; slot <= 16; slot++) {
             if (slot >= handler.slots.size()) break;
             var stack = handler.slots.get(slot).getStack();
             if (stack.isEmpty()) continue;
             try {
-                List<Text> tooltip = stack.getTooltip(
-                        net.minecraft.item.Item.TooltipContext.DEFAULT, null,
-                        net.minecraft.item.tooltip.TooltipType.BASIC);
+                List<Text> tooltip = stack.getTooltip(net.minecraft.item.Item.TooltipContext.DEFAULT, null, net.minecraft.item.tooltip.TooltipType.BASIC);
                 for (Text line : tooltip) {
-                    String t = ChatHelper.stripColors(line.getString());
-                    if (t.contains(workerNick) || t.contains(String.valueOf(amount))) {
-                        Secret.LOGGER.info("[BANK] Found stavka at slot {}", slot);
-                        return slot;
-                    }
+                    String t = ChatHelper.stripColors(line.getString()).toLowerCase();
+                    if (t.contains(nick.toLowerCase()) || t.contains(String.valueOf(amount))) return slot;
                 }
             } catch (Exception ignored) {}
         }
         return -1;
     }
 
-    private void sendChat(MinecraftClient client, String message) {
-        client.execute(() -> {
-            if (client.player == null) {
-                Secret.LOGGER.warn("[BANK] sendChat: player null! msg={}", message);
-                return;
-            }
-            try {
-                if (message.startsWith("/")) {
-                    client.player.networkHandler.sendCommand(message.substring(1));
-                } else {
-                    client.player.networkHandler.sendChatMessage(message);
+    @Override
+    public void onCaptchaAnswer(String answer) {
+        captchaSent = false;
+        sendChat(MinecraftClient.getInstance(), answer);
+    }
+
+    private void doBanned() {
+        stopAfkProtection();
+        captchaSent = false;
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> { if (client.player != null) client.disconnect(); });
+
+        sendTelegramDebug("🚫 Запуск смены IP через WARP VPN...");
+        new Thread(() -> {
+            if (SecretClient.vpnController.changeIp()) {
+                try { Thread.sleep(10000); } catch (InterruptedException ignored) {}
+                if (isRunning.get() && currentState == BotState.BANNED) {
+                    SecretClient.accountManager.switchToBank();
+                    transitionTo(BotState.CONNECTING_TO_SERVER);
                 }
-                Secret.LOGGER.info("[BANK] Chat: {}", message);
-            } catch (Exception e) {
-                Secret.LOGGER.error("[BANK] sendChat error: {}", e.getMessage());
+            } else {
+                scheduler.schedule(() -> {
+                    if (isRunning.get() && currentState == BotState.BANNED) doBanned();
+                }, 30, TimeUnit.SECONDS);
             }
+        }, "Bank-VPN-Thread").start();
+    }
+
+    private void startAfkProtection(MinecraftClient client) {
+        stopAfkProtection();
+        afkTask = scheduler.scheduleAtFixedRate(() -> client.execute(() -> { if (client.player != null) client.player.jump(); }), 50, 50, TimeUnit.SECONDS);
+    }
+
+    private void stopAfkProtection() { if (afkTask != null) { afkTask.cancel(false); afkTask = null; } }
+
+    private void onBankChat(String raw) {
+        if (!isRunning.get()) return;
+        String clean = ChatHelper.stripColors(raw).toLowerCase().trim();
+
+        if (clean.contains("начислен") || clean.contains("забрал") || clean.contains("получен")) {
+            rewardReceived = true;
+        }
+
+        if (clean.contains("твоя ставка выиграла") || (clean.contains("ставка игрока") && clean.contains("выиграла"))) {
+            sendTelegramDebug("🎲 Раунд ставок завершен. Синхронизирую балансы через 4 секунды...");
+            scheduler.schedule(() -> {
+                if (isRunning.get() && currentState == BotState.IDLE) startStavkaEngine();
+            }, 4, TimeUnit.SECONDS);
+        }
+
+        if (clean.contains("введи цифры") || clean.contains("введите цифры")) {
+            if (!captchaSent) { captchaSent = true; captureAndSendScreenshot(MinecraftClient.getInstance(), "[БАНК]"); }
+        }
+        if (clean.contains("авторизуйт") || clean.contains("/l ")) {
+            scheduler.schedule(() -> { if (isRunning.get()) sendChat(MinecraftClient.getInstance(), "/l " + Secret.BANK_PASSWORD); }, 1, TimeUnit.SECONDS);
+        }
+        if (clean.contains("зарегистрируйт") || clean.contains("/reg ")) {
+            scheduler.schedule(() -> { if (isRunning.get()) sendChat(MinecraftClient.getInstance(), "/reg " + Secret.BANK_PASSWORD + " " + Secret.BANK_PASSWORD); }, 1, TimeUnit.SECONDS);
+        }
+        if (clean.contains("добро пожаловать") || clean.contains("welcome")) transitionTo(BotState.JOINING_QUEUE);
+    }
+
+    private void captureAndSendScreenshot(MinecraftClient client, String prefix) {
+        scheduler.schedule(() -> client.execute(() -> {
+            try {
+                net.minecraft.client.texture.NativeImage image = net.minecraft.client.util.ScreenshotRecorder.takeScreenshot(client.getFramebuffer());
+                File dir = new File(client.runDirectory, "screenshots"); if (!dir.exists()) dir.mkdirs();
+                File file = new File(dir, "captcha_tg.png"); image.writeTo(file); image.close();
+                if (SecretClient.telegramBot != null) SecretClient.telegramBot.sendPhoto(file, prefix + " 🔐 КАПЧА!");
+            } catch (Exception ignored) {}
+        }), 1000, TimeUnit.MILLISECONDS);
+    }
+
+    private void clickSlot(HandledScreen<?> screen, int slot) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> {
+            try { client.interactionManager.clickSlot(screen.getScreenHandler().syncId, slot, 0, SlotActionType.PICKUP, client.player); } catch (Exception ignored) {}
         });
     }
+
+    private void sendChat(MinecraftClient client, String message) {
+        client.execute(() -> {
+            if (client.player == null) return;
+            if (message.startsWith("/")) client.player.networkHandler.sendCommand(message.substring(1));
+            else client.player.networkHandler.sendChatMessage(message);
+        });
+    }
+
+    private void registerChatListeners() { chatHandler = this::onBankChat; ChatListener.addHandler(chatHandler); }
+    private long getDelay(BotState state) { return switch (state) { case CONNECTING_TO_SERVER -> 1000; case WAITING_SPAWN -> 3000; case WRITING_FREE -> 2000; default -> 800; }; }
+
+    @Override public void onWorkerCreatedStavka(String nick, int amount) {}
+    @Override public void onBankConnected(String bankNick) {}
+    @Override public void onBankReady() {}
 }
