@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "secret",
+  "version": "${version}",
+  "name": "Secret Farm",
+  "description": "Automated farm",
+  "authors": ["vovochka"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      "org.vovochka.fun.secret.Secret"
+    ],
+    "client": [
+      "org.vovochka.fun.secret.SecretClient"
+    ]
+  },
+  "mixins": [],
+  "depends": {
+    "fabricloader": ">=0.16.10",
+    "fabric": "*",
+    "minecraft": "~1.21.4",
+    "java": ">=21"
+  }
+}
